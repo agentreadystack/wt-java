@@ -1,0 +1,19 @@
+name: Feature request
+description: Suggest an idea for wt-java
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: e.g. "my agents collide on Kafka topics when..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered

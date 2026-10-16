@@ -1,0 +1,35 @@
+name: Bug report
+description: Something in wt-java doesn't work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Command you ran, what you expected, what you got (paste output).
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. wt-java new foo
+        2. ...
+  - type: input
+    id: version
+    attributes:
+      label: wt-java version
+      placeholder: output of `wt-java --version`
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: OS, bash and git version
+      placeholder: macOS 15, bash 3.2, git 2.46
+  - type: textarea
+    id: conf
+    attributes:
+      label: .wt-java.conf (remove passwords)
+      render: ini

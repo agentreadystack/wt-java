@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# wt-java: isolated environments for parallel git worktrees in Java/Spring projects.
+# https://github.com/agentreadystack/wt-java  (MIT)
+set -euo pipefail
+
+VERSION="0.2.0"
+
+die() { echo "wt-java: $*" >&2; exit 1; }
+warn() { echo "wt-java: warning: $*" >&2; }
+info() { [ -n "${WT_JAVA_QUIET:-}" ] || echo "$*"; }
+
+usage() {
+  cat <<USAGE
+wt-java $VERSION - one port, DB schema and Redis db per git worktree
+
+Usage:
+  wt-java new <name> [base-ref]      create ../<repo>-<name> on branch wt/<name>, allocate a slot,
+                                     create the Postgres schema, write .env.worktree + Spring config,
+                                     copy configured files, optionally run npm ci
+  wt-java rm <name> [options]        remove the worktree, flush its Redis db, free its slot
+      --drop-db                      also DROP SCHEMA ... CASCADE
+      --keep-redis                   do not FLUSHDB the worktree's Redis db
+      --delete-branch                also delete branch wt/<name>
+      --force                        remove even with uncommitted changes
+  wt-java ls                         list managed worktrees
+  wt-java env <name>                 print the worktree's .env.worktree
+  wt-java gc                         drop registry entries whose directory no longer exists
+  wt-java --version | --help
+
+Configuration: environment variables or a .wt-java.conf (KEY=VALUE) in the main repo root.
+Environment variables win over the file. See README for all keys.
+USAGE
+}
+
+# ---------- repo + config ----------
+repo_root() { git rev-parse --show-toplevel 2>/dev/null || die "not inside a git repository"; }
+main_root() { dirname "$(cd "$(repo_root)" && git rev-parse --path-format=absolute --git-common-dir)"; }
+registry() { echo "$(main_root)/.git/wt-java.registry"; }   # lines: name|slot|path
+
+CONF_KEYS='^(WT_JAVA_[A-Z_]+|PGHOST|PGPORT|PGUSER|PGPASSWORD|PGDATABASE|REDIS_HOST|REDIS_PORT|REDIS_PASSWORD)$'
+
+load_config() {
+  local conf key val
+  conf="$(main_root)/.wt-java.conf"
+  if [ -f "$conf" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line%$'\r'}"
+      [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+      [[ "$line" == *=* ]] || { warn "ignoring malformed line in .wt-java.conf: $line"; continue; }
+      key="${line%%=*}"; key="${key//[[:space:]]/}"; val="${line#*=}"
+      val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+      if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then val="${BASH_REMATCH[1]}"; fi
+      [[ "$key" =~ $CONF_KEYS ]] || { warn "ignoring unknown key in .wt-java.conf: $key"; continue; }
+      [ -n "${!key+x}" ] || export "$key=$val"   # env wins
+    done <"$conf"
+  fi
+  BASE_PORT="${WT_JAVA_BASE_PORT:-8100}"
+  VITE_BASE_PORT="${WT_JAVA_VITE_BASE_PORT:-5200}"
+  MAX_REDIS_DB="${WT_JAVA_MAX_REDIS_DB:-15}"
+  DB_MODE="${WT_JAVA_DB:-auto}"          # auto | postgres | none
+  REDIS_MODE="${WT_JAVA_REDIS:-auto}"    # auto | on | none
+  SPRING_DIR="${WT_JAVA_SPRING_DIR:-.}"  # where `mvnw spring-boot:run` is executed
+  SPRING_CONFIG="${WT_JAVA_SPRING_CONFIG:-on}"
+  COPY_LIST="${WT_JAVA_COPY:-.env}"
+  NPM_CI_DIR="${WT_JAVA_NPM_CI:-}"
+  for v in BASE_PORT VITE_BASE_PORT MAX_REDIS_DB; do
+    [[ "${!v}" =~ ^[0-9]+$ ]] || die "$v must be a number"
+  done
+}
+
+valid_name() { [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,40}$ ]] || die "invalid name '$1' (letters, digits, . _ -; max 41 chars)"; }
+schema_for() { echo "wt_$(tr '.-' '__' <<<"$1" | tr '[:upper:]' '[:lower:]')"; }
+reg_line() { local reg; reg="$(registry)"; if [ -f "$reg" ]; then awk -F'|' -v n="$1" '$1 == n' "$reg"; fi; }
+
+next_slot() {
+  local reg used s
+  reg="$(registry)"; used=""; if [ -f "$reg" ]; then used="$(cut -d'|' -f2 "$reg")"; fi
+  for ((s = 1; s <= MAX_REDIS_DB; s++)); do
+    grep -qx "$s" <<<"$used" || { echo "$s"; return; }
+  done
+  die "no free slots (max $MAX_REDIS_DB worktrees; raise WT_JAVA_MAX_REDIS_DB)"
+}
+
+port_free() { ! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+git_exclude() {   # keep generated files out of git status without touching tracked .gitignore
+  local path="$1" pattern="$2" excl
+  excl="$(git -C "$path" rev-parse --path-format=absolute --git-path info/exclude)"
+  mkdir -p "$(dirname "$excl")"
+  grep -qxF "$pattern" "$excl" 2>/dev/null || echo "$pattern" >>"$excl"
+}
+
+# ---------- PostgreSQL ----------
+pg_enabled() {
+  case "$DB_MODE" in
+    none|off) return 1 ;;
+    postgres|on) command -v psql >/dev/null || { warn "psql not found; skipping schema step"; return 1; } ;;
+    auto) command -v psql >/dev/null || return 1 ;;
+    *) warn "unknown WT_JAVA_DB='$DB_MODE' (use auto|postgres|none)"; return 1 ;;
+  esac
+}
+pg_exec() {
+  PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-3}" psql -X -q -v ON_ERROR_STOP=1 -c "$1" >/dev/null 2>"${TMPDIR:-/tmp}/wt-java.pg.$$"
+}
+pg_err() { local f="${TMPDIR:-/tmp}/wt-java.pg.$$"; head -n1 "$f" 2>/dev/null; rm -f "$f"; }
+
+# ---------- Redis ----------
+redis_enabled() {
+  case "$REDIS_MODE" in
+    none|off) return 1 ;;
+    on) command -v redis-cli >/dev/null || { warn "redis-cli not found; skipping Redis step"; return 1; } ;;
+    auto) command -v redis-cli >/dev/null || return 1 ;;
+    *) warn "unknown WT_JAVA_REDIS='$REDIS_MODE' (use auto|on|none)"; return 1 ;;
+  esac
+}
+redis_cmd() {
+  local args=(-h "${REDIS_HOST:-127.0.0.1}" -p "${REDIS_PORT:-6379}")
+  if [ -n "${REDIS_PASSWORD:-}" ]; then REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli "${args[@]}" "$@"; else redis-cli "${args[@]}" "$@"; fi
+}
+
+# ---------- commands ----------
+write_spring_config() {
+  local path="$1" port="$2" schema="$3" slot="$4" dir
+  dir="$path/$SPRING_DIR/config"
+  mkdir -p "$dir"
+  local yml
+  yml="# generated by wt-java $VERSION for worktree '$(basename "$path")' - do not commit
+# Spring Boot loads ./config/application*.yml from the working directory automatically.
+server:
+  port: $port
+spring:
+  datasource:
+    hikari:
+      schema: $schema
+  flyway:
+    schemas: $schema
+    default-schema: $schema
+  jpa:
+    properties:
+      hibernate:
+        default_schema: $schema
+  data:
+    redis:
+      database: $slot
+"
+  printf '%s' "$yml" >"$dir/application-wt.yml"
+  local rel="${SPRING_DIR#./}"; rel="${rel%/}"; [ "$rel" = "." ] && rel=""
+  local prefix="${rel:+$rel/}config"
+  git_exclude "$path" "/$prefix/application-wt.yml"
+  # also as ./config/application.yml so plain `./mvnw spring-boot:run` picks it up without a profile
+  if git -C "$path" ls-files --error-unmatch "$prefix/application.yml" >/dev/null 2>&1; then
+    warn "$prefix/application.yml is tracked; not overwriting it. Run with SPRING_PROFILES_ACTIVE=wt"
+  elif [ -e "$dir/application.yml" ]; then
+    warn "$prefix/application.yml exists; not overwriting it. Run with SPRING_PROFILES_ACTIVE=wt"
+  else
+    printf '%s' "$yml" >"$dir/application.yml"
+    git_exclude "$path" "/$prefix/application.yml"
+  fi
+}
+
+copy_files() {
+  local root="$1" path="$2" f
+  for f in $COPY_LIST; do
+    case "$f" in /*|*..*) warn "copy: skipping unsafe path '$f'"; continue ;; esac
+    [ -e "$root/$f" ] || continue
+    if git -C "$root" ls-files --error-unmatch "$f" >/dev/null 2>&1; then continue; fi  # tracked => already there
+    mkdir -p "$(dirname "$path/$f")"
+    cp -R "$root/$f" "$path/$f"
+    info "  copied $f"
+  done
+}
+
+cmd_new() {
+  local name="${1:-}" base="${2:-HEAD}"
+  [ -n "$name" ] || die "usage: wt-java new <name> [base-ref]"
+  valid_name "$name"
+  local root reg path slot port vport schema
+  root="$(main_root)"; reg="$(registry)"
+  [ -z "$(reg_line "$name")" ] || die "worktree '$name' already exists"
+  path="$(dirname "$root")/$(basename "$root")-$name"
+  [ ! -e "$path" ] || die "$path already exists"
+  slot="$(next_slot)"
+  port=$((BASE_PORT + slot)); vport=$((VITE_BASE_PORT + slot))
+  port_free "$port" || warn "port $port is in use"
+  schema="$(schema_for "$name")"
+
+  git -C "$root" worktree add -q -b "wt/$name" "$path" "$base"
+  echo "$name|$slot|$path" >>"$reg"
+
+  cat >"$path/.env.worktree" <<ENV
+# generated by wt-java $VERSION - do not commit
+WT_NAME=$name
+SERVER_PORT=$port
+VITE_PORT=$vport
+SPRING_PROFILES_ACTIVE=local,wt
+DB_SCHEMA=$schema
+SPRING_FLYWAY_SCHEMAS=$schema
+SPRING_DATASOURCE_HIKARI_SCHEMA=$schema
+REDIS_DB=$slot
+SPRING_DATA_REDIS_DATABASE=$slot
+ENV
+  git_exclude "$path" ".env.worktree"
+  [ "$SPRING_CONFIG" = "off" ] || write_spring_config "$path" "$port" "$schema" "$slot"
+
+  info "created $path (branch wt/$name) port=$port vite=$vport schema=$schema redis_db=$slot"
+
+  if pg_enabled; then
+    if pg_exec "CREATE SCHEMA IF NOT EXISTS \"$schema\""; then
+      rm -f "${TMPDIR:-/tmp}/wt-java.pg.$$"; info "  postgres: schema $schema ready"
+    else
+      warn "could not create schema $schema ($(pg_err)). Create it later or set WT_JAVA_DB=none"
+    fi
+  fi
+  copy_files "$root" "$path"
+  if [ -n "$NPM_CI_DIR" ]; then
+    if [ -f "$path/$NPM_CI_DIR/package-lock.json" ] && command -v npm >/dev/null; then
+      info "  npm ci in $NPM_CI_DIR (shared ~/.npm cache)..."
+      (cd "$path/$NPM_CI_DIR" && npm ci --prefer-offline --no-audit --no-fund >/dev/null) || warn "npm ci failed in $NPM_CI_DIR"
+    else
+      warn "npm ci skipped: no npm or no $NPM_CI_DIR/package-lock.json"
+    fi
+  fi
+}
+
+cmd_rm() {
+  local name="" force="" drop_db="" keep_redis="" del_branch=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force="--force" ;;
+      --drop-db) drop_db=1 ;;
+      --keep-redis) keep_redis=1 ;;
+      --delete-branch) del_branch=1 ;;
+      -*) die "unknown option $1" ;;
+      *) [ -z "$name" ] || die "unexpected argument $1"; name="$1" ;;
+    esac; shift
+  done
+  [ -n "$name" ] || die "usage: wt-java rm <name> [--drop-db] [--keep-redis] [--delete-branch] [--force]"
+  local reg line slot path root
+  root="$(main_root)"; reg="$(registry)"
+  line="$(reg_line "$name")"
+  [ -n "$line" ] || die "no managed worktree named '$name'"
+  slot="$(cut -d'|' -f2 <<<"$line")"; path="$(cut -d'|' -f3 <<<"$line")"
+
+  if [ -d "$path" ]; then
+    # generated files are ignored, so `worktree remove` without --force still protects real changes
+    git -C "$root" worktree remove $force "$path"
+  else
+    git -C "$root" worktree prune
+  fi
+  awk -F'|' -v n="$name" '$1 != n' "$reg" >"$reg.tmp"; mv "$reg.tmp" "$reg"
+
+  if [ -z "$keep_redis" ] && redis_enabled; then
+    if redis_cmd -n "$slot" FLUSHDB >/dev/null 2>&1; then info "  redis: flushed db $slot"
+    else warn "could not FLUSHDB redis db $slot (is Redis running?)"; fi
+  fi
+  if [ -n "$drop_db" ]; then
+    local schema; schema="$(schema_for "$name")"
+    if pg_enabled; then
+      if pg_exec "DROP SCHEMA IF EXISTS \"$schema\" CASCADE"; then rm -f "${TMPDIR:-/tmp}/wt-java.pg.$$"; info "  postgres: dropped schema $schema"
+      else warn "could not drop schema $schema ($(pg_err))"; fi
+    else
+      warn "--drop-db given but Postgres step is disabled or psql missing"
+    fi
+  fi
+  if [ -n "$del_branch" ]; then
+    git -C "$root" branch -D "wt/$name" >/dev/null && info "  deleted branch wt/$name"
+    info "removed $path"
+  else
+    info "removed $path (branch wt/$name kept; delete with: git branch -D wt/$name)"
+  fi
+}
+
+cmd_ls() {
+  local reg; reg="$(registry)"
+  [ -s "$reg" ] || { echo "no managed worktrees"; return; }
+  printf '%-22s %-6s %-6s %-8s %-24s %s\n' NAME PORT VITE REDIS SCHEMA PATH
+  while IFS='|' read -r n s p; do
+    local mark=""; [ -d "$p" ] || mark=" (missing - run wt-java gc)"
+    printf '%-22s %-6s %-6s %-8s %-24s %s%s\n' "$n" $((BASE_PORT + s)) $((VITE_BASE_PORT + s)) "$s" "$(schema_for "$n")" "$p" "$mark"
+  done <"$reg"
+}
+
+cmd_env() {
+  local name="${1:-}" line
+  [ -n "$name" ] || die "usage: wt-java env <name>"
+  line="$(reg_line "$name")"; [ -n "$line" ] || die "no managed worktree named '$name'"
+  cat "$(cut -d'|' -f3 <<<"$line")/.env.worktree"
+}
+
+cmd_gc() {
+  local reg n s p removed=0; reg="$(registry)"
+  git -C "$(main_root)" worktree prune
+  [ -s "$reg" ] || { info "nothing to clean"; return; }
+  : >"$reg.tmp"
+  while IFS='|' read -r n s p; do
+    if [ -d "$p" ]; then echo "$n|$s|$p" >>"$reg.tmp"; else info "  dropped stale entry $n ($p)"; removed=$((removed + 1)); fi
+  done <"$reg"
+  mv "$reg.tmp" "$reg"
+  info "gc: removed $removed stale entr$([ "$removed" -eq 1 ] && echo y || echo ies)"
+}
+
+case "${1:-}" in
+  --version|-v) echo "$VERSION"; exit 0 ;;
+  ""|--help|-h) usage; exit 0 ;;
+esac
+load_config
+case "$1" in
+  new) shift; cmd_new "$@" ;;
+  rm) shift; cmd_rm "$@" ;;
+  ls) cmd_ls ;;
+  env) shift; cmd_env "$@" ;;
+  gc) cmd_gc ;;
+  *) usage >&2; exit 1 ;;
+esac

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: AgentReady Stack (full Spring Boot + Vue SaaS starter)
+    url: https://agentreadystack.com
+    about: Questions about the paid starter kit go here, not in wt-java issues.
